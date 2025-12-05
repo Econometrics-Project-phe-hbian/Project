@@ -1,17 +1,141 @@
-"upload packages"
-install.packages("data.table")
+# Load required packages
 library(data.table)
-install.packages("fixest")
 library(fixest)
-install.packages("ggplot2")
 library(ggplot2)
-install.packages("dplyr")
 library(dplyr)
-install.packages("haven")
 library(haven)
-install.packages("patchwork")
 library(patchwork)
-"check and read dataset"
-reg <- read.csv("~/Project/GMFD_TINV_clim_regsort.csv")
-brk <- read.csv("~/Project/break_data_TINV_clim.csv")
 
+# Load data
+break_data <- read.csv("break_data_TINV_clim.csv")
+reg_data <- read.csv("GMFD_TINV_clim_regsort.csv")
+
+# === USER SETTINGS ===
+model <- "TINV_clim"
+var <- "electricity"                    # or "other_energy"
+fig <- "fig_Appendix-G3A"
+output_path <- "figures"
+outcome_var <- "FD_load_pc"             # Confirmed dependent variable
+pg <- if (var == "electricity") 1 else 2
+
+# === Fit model ===
+model_fit <- feols(
+  FD_load_pc ~ 
+    indp1 * indf1 * FD_yeartemp1_GMFD +
+    indp1 * indf1 * FD_yeartemp2_GMFD +
+    indp1 * indf1 * FD_dc1_lgdppc_MA15yearI1temp1 +
+    indp1 * indf1 * FD_dc1_lgdppc_MA15yearI1temp2 +
+    indp1 * indf1 * FD_dc1_lgdppc_MA15yearI2temp1 +
+    indp1 * indf1 * FD_dc1_lgdppc_MA15yearI2temp2,
+  data = reg_data
+)
+
+# === Generate prediction dataset ===
+plot_data <- data.frame(temp1 = seq(-5, 35, by = 1)) %>%
+  mutate(temp2 = temp1^2)
+
+# === Get knot location from break_data ===
+gpid_var <- paste0("largegpid_", var)
+maxInc_var <- paste0("maxInc_largegpid_", var)
+
+ibar <- break_data %>%
+  filter(.data[[gpid_var]] == 1) %>%
+  summarise(maxInc = max(.data[[maxInc_var]], na.rm = TRUE)) %>%
+  pull(maxInc)
+
+# === Get average income terciles ===
+avg_incomes <- break_data %>%
+  filter(!is.na(avgInc_tgpid)) %>%
+  distinct(tpid, tgpid, .keep_all = TRUE) %>%
+  arrange(avgInc_tgpid) %>%
+  pull(avgInc_tgpid)
+
+tercile_avgs <- quantile(avg_incomes, probs = c(1/6, 3/6, 5/6), na.rm = TRUE)
+
+# === Loop through income terciles ===
+plots <- list()
+
+for (lg in 1:3) {
+  subInc <- tercile_avgs[lg]
+  deltacut_subInc <- subInc - ibar
+  ig <- if (subInc > ibar) 2 else 1
+  
+  line <- rep(0, nrow(plot_data))
+  
+  # === Predicted marginal effect line ===
+  for (k in 1:2) {
+    term1 <- paste0("indp", pg, ":indf1:FD_yeartemp", k, "_GMFD")
+    term2 <- paste0("indp", pg, ":indf1:FD_dc1_lgdppc_MA15yearI", ig, "temp", k)
+    
+    tempk <- plot_data[[paste0("temp", k)]]
+    centered_tempk <- tempk - 20^k
+    
+    b1 <- if (term1 %in% names(coef(model_fit))) coef(model_fit)[term1] else 0
+    b2 <- if (term2 %in% names(coef(model_fit))) coef(model_fit)[term2] else 0
+    
+    line <- line + b1 * centered_tempk + b2 * deltacut_subInc * centered_tempk
+  }
+  
+  # === Delta method SEs ===
+  se_vec <- rep(0, length(line))
+  vcov_mat <- vcov(model_fit)
+  
+  for (k in 1:2) {
+    term1 <- paste0("indp", pg, ":indf1:FD_yeartemp", k, "_GMFD")
+    term2 <- paste0("indp", pg, ":indf1:FD_dc1_lgdppc_MA15yearI", ig, "temp", k)
+    
+    tempk <- plot_data[[paste0("temp", k)]]
+    centered_tempk <- tempk - 20^k
+    
+    v1 <- if (term1 %in% rownames(vcov_mat)) vcov_mat[term1, term1] else 0
+    v2 <- if (term2 %in% rownames(vcov_mat)) vcov_mat[term2, term2] else 0
+    cov12 <- if (term1 %in% rownames(vcov_mat) && term2 %in% rownames(vcov_mat)) vcov_mat[term1, term2] else 0
+    
+    se_vec <- se_vec + (centered_tempk^2) * (v1 + (deltacut_subInc^2) * v2 + 2 * deltacut_subInc * cov12)
+  }
+  
+  se <- sqrt(se_vec)
+  lower <- line - 1.96 * se
+  upper <- line + 1.96 * se
+  
+  # === Data frame for plotting ===
+  df_plot <- plot_data %>%
+    mutate(
+      yhat = line,
+      lower = lower,
+      upper = upper
+    )
+  
+  # === Plot ===
+  p <- ggplot(df_plot, aes(x = temp1, y = yhat)) +
+    geom_ribbon(aes(ymin = lower, ymax = upper), fill = "lightblue", alpha = 0.4) +
+    geom_line(color = "darkblue", size = 1) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+    scale_x_continuous(breaks = seq(-5, 35, 10)) +
+    labs(
+      subtitle = paste("Income Tercile", lg),
+      x = "Temperature (°C)",
+      y = "Marginal Effect of Year"
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      plot.subtitle = element_text(color = "darkgreen", size = 10),
+      axis.text = element_text(size = 9),
+      axis.title = element_text(size = 10)
+    )
+  
+  plots[[lg]] <- p
+}
+
+# === Combine plots ===
+final_plot <- wrap_plots(plots, nrow = 1) +
+  plot_annotation(title = paste("Marginal Effect of Time on", var, "Response Function"))
+
+# === Ensure folder exists ===
+if (!dir.exists(output_path)) dir.create(output_path)
+
+# === Save plot as PDF ===
+ggsave(
+  filename = file.path(output_path, paste0(fig, "_ME_time_", model, "_lininter_", var, ".pdf")),
+  plot = final_plot, width = 9, height = 3
+)
